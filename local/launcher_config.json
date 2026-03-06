@@ -1,0 +1,5 @@
+{
+  "results_root": "C:/Users/HemaLab/Desktop/pipeline/klinakis/data",
+  "db_path": "C:\\Users\\HemaLab\\Desktop\\pipeline\\klinakis\\dashboard\\local\\tumor_normal_variant_dashboard.duckdb",
+  "igv_js_path": "C:\\Users\\HemaLab\\Desktop\\pipeline\\klinakis\\dashboard\\local\\igv.min.js"
+}

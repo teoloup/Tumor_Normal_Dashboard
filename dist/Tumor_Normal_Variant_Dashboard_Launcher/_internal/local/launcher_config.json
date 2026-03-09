@@ -1,6 +1,0 @@
-{
-  "launch_mode": "docker",
-  "results_root": "C:/Users/HemaLab/Desktop/pipeline/klinakis/data",
-  "db_path": "C:\\Users\\HemaLab\\Desktop\\pipeline\\klinakis\\dist\\Tumor_Normal_Variant_Dashboard_Launcher\\_internal\\local\\tumor_normal_variant_dashboard.duckdb",
-  "igv_js_path": "C:\\Users\\HemaLab\\Desktop\\pipeline\\klinakis\\dist\\Tumor_Normal_Variant_Dashboard_Launcher\\_internal\\local\\igv.min.js"
-}

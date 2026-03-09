@@ -1,0 +1,6 @@
+app/.venv/
+app/build_artifacts/
+app/__pycache__/
+app/local/
+docker/__pycache__/
+__pycache__/

@@ -29,7 +29,8 @@ SAMPLE_COLUMNS = [
     "flagstat_err",
     "mosdepth_before_summary_txt",
     "mosdepth_after_summary_txt",
-    "per_base_bed_gz",
+    "before_per_base_bed_gz",
+    "after_per_base_bed_gz",
     "bam_path",
     "bai_path",
     "bam_relpath",
@@ -50,6 +51,7 @@ ANALYSIS_COLUMNS = [
     "tissue_sample_id",
     "analysis_dir",
     "tumor_annotation_csv",
+    "tissue_pass_annotation_csv",
     "tissue_annotation_csv",
     "tumor_filtered_vcf",
     "tumor_pass_vcf",
@@ -124,6 +126,46 @@ TUMOR_PASS_COLUMNS = [
     "tissue_row_json",
 ]
 
+TISSUE_VARIANT_COLUMNS = [
+    "patient_id",
+    "blood_sample_id",
+    "tumor_sample_id",
+    "tissue_sample_id",
+    "analysis_dir",
+    "variant_key",
+    "chrom",
+    "pos",
+    "end",
+    "ref",
+    "alt",
+    "gene",
+    "hgvs",
+    "clinvar",
+    "dbsnp",
+    "cosmic",
+    "intervar",
+    "tissue_af",
+    "tissue_dp",
+    "matched_in_tumor",
+    "tumor_af",
+    "tumor_dp",
+    "tumor_gene",
+    "tumor_hgvs",
+    "tissue_filter",
+    "tumor_filter",
+    "tissue_row_json",
+    "tumor_row_json",
+]
+
+WARNING_COLUMNS = [
+    "warning_type",
+    "scope",
+    "patient_id",
+    "sample_id",
+    "tissue_sample_id",
+    "details",
+]
+
 
 @dataclass
 class ParsedSample:
@@ -147,7 +189,8 @@ class SampleRecord:
     flagstat_err: str
     mosdepth_before_summary_txt: str
     mosdepth_after_summary_txt: str
-    per_base_bed_gz: str
+    before_per_base_bed_gz: str
+    after_per_base_bed_gz: str
     bam_path: str
     bai_path: str
     bam_relpath: str
@@ -169,6 +212,7 @@ class AnalysisRecord:
     tissue_sample_id: str
     analysis_dir: str
     tumor_annotation_csv: str
+    tissue_pass_annotation_csv: str
     tissue_annotation_csv: str
     tumor_filtered_vcf: str
     tumor_pass_vcf: str
@@ -339,7 +383,8 @@ def build_sample_records(results_root: Path) -> list[dict[str, Any]]:
         flagstat_err = find_first(sterr_dir, "*_flagstat.err")
         mosdepth_before_summary = find_first(stats_dir, "*_before_gencore.mosdepth.summary.txt")
         mosdepth_after_summary = find_first(stats_dir, "*_after_gencore.mosdepth.summary.txt")
-        per_base_bed = find_first(stats_dir, "*_after_gencore.per-base.bed.gz")
+        before_per_base_bed = find_first(stats_dir, "*_before_gencore.per-base.bed.gz")
+        after_per_base_bed = find_first(stats_dir, "*_after_gencore.per-base.bed.gz")
         bam_path = find_first(child, "*_005_RG.bam", recursive=True)
         bai_path = find_first_of(child, ["*_005_RG.bam.bai", "*_005_RG.bai"], recursive=True)
 
@@ -361,7 +406,8 @@ def build_sample_records(results_root: Path) -> list[dict[str, Any]]:
             flagstat_err=path_or_empty(flagstat_err),
             mosdepth_before_summary_txt=path_or_empty(mosdepth_before_summary),
             mosdepth_after_summary_txt=path_or_empty(mosdepth_after_summary),
-            per_base_bed_gz=path_or_empty(per_base_bed),
+            before_per_base_bed_gz=path_or_empty(before_per_base_bed),
+            after_per_base_bed_gz=path_or_empty(after_per_base_bed),
             bam_path=path_or_empty(bam_path),
             bai_path=path_or_empty(bai_path),
             bam_relpath=relpath_or_empty(bam_path, results_root),
@@ -423,6 +469,7 @@ def build_analysis_records(results_root: Path, sample_df: pd.DataFrame) -> list[
         tissue_dir = analysis_dir / "tissue"
 
         tumor_annotation_csv = tumor_dir / f"{patient_id}_tumor_PASSonly_Annotated.hg38_multianno.csv"
+        tissue_pass_annotation_csv = tissue_dir / f"{patient_id}_tissue_PASSonly_Annotated.hg38_multianno.csv"
         tissue_annotation_csv = tissue_dir / f"{patient_id}_tissue_onlyTumorPassVariants_Annotated.hg38_multianno.csv"
         tumor_filtered_vcf = tumor_dir / f"{patient_id}_tumor_TN_Filtered.vcf.gz"
         tumor_pass_vcf = tumor_dir / f"{patient_id}_tumor_PASSonly.vcf.gz"
@@ -437,6 +484,7 @@ def build_analysis_records(results_root: Path, sample_df: pd.DataFrame) -> list[
             tissue_sample_id=tissue_sample_id,
             analysis_dir=str(analysis_dir),
             tumor_annotation_csv=path_or_empty(tumor_annotation_csv if tumor_annotation_csv.exists() else None),
+            tissue_pass_annotation_csv=path_or_empty(tissue_pass_annotation_csv if tissue_pass_annotation_csv.exists() else None),
             tissue_annotation_csv=path_or_empty(tissue_annotation_csv if tissue_annotation_csv.exists() else None),
             tumor_filtered_vcf=path_or_empty(tumor_filtered_vcf if tumor_filtered_vcf.exists() else None),
             tumor_pass_vcf=path_or_empty(tumor_pass_vcf if tumor_pass_vcf.exists() else None),
@@ -544,6 +592,148 @@ def numeric_value(row: pd.Series, columns: list[Optional[str]]) -> Optional[floa
     return None
 
 
+def validate_results(results_root: Path, sample_df: pd.DataFrame, analysis_df: pd.DataFrame) -> list[dict[str, str]]:
+    warnings: list[dict[str, str]] = []
+    manifest_path = results_root / "patient_triplets.tsv"
+
+    if sample_df.empty:
+        warnings.append({
+            "warning_type": "missing_samples",
+            "scope": "results_root",
+            "patient_id": "",
+            "sample_id": "",
+            "tissue_sample_id": "",
+            "details": "No sample directories matching the expected naming pattern were found under the synced results root.",
+        })
+        return warnings
+
+    sample_duplicates = sample_df[sample_df.duplicated(subset=["sample_id"], keep=False)]
+    for sample_id in sorted(sample_duplicates["sample_id"].dropna().unique().tolist()):
+        warnings.append({
+            "warning_type": "duplicate_sample_id",
+            "scope": "sample_directory",
+            "patient_id": "",
+            "sample_id": sample_id,
+            "tissue_sample_id": "",
+            "details": f"Sample ID `{sample_id}` appears more than once in the synced results tree.",
+        })
+
+    if not manifest_path.exists():
+        warnings.append({
+            "warning_type": "missing_manifest",
+            "scope": "results_root",
+            "patient_id": "",
+            "sample_id": "",
+            "tissue_sample_id": "",
+            "details": "patient_triplets.tsv was not found. The dashboard fell back to inferring analyses from the directory layout.",
+        })
+        return warnings
+
+    try:
+        with manifest_path.open(newline="") as handle:
+            manifest_df = pd.read_csv(handle, sep="\t", dtype=str).fillna("")
+    except (OSError, pd.errors.ParserError):
+        warnings.append({
+            "warning_type": "manifest_parse_error",
+            "scope": "manifest",
+            "patient_id": "",
+            "sample_id": "",
+            "tissue_sample_id": "",
+            "details": "patient_triplets.tsv could not be parsed.",
+        })
+        return warnings
+
+    required_columns = {"patient", "blood", "tumor", "tissue"}
+    if not required_columns.issubset(set(manifest_df.columns)):
+        warnings.append({
+            "warning_type": "manifest_missing_columns",
+            "scope": "manifest",
+            "patient_id": "",
+            "sample_id": "",
+            "tissue_sample_id": "",
+            "details": "patient_triplets.tsv is missing one or more required columns: patient, blood, tumor, tissue.",
+        })
+        return warnings
+
+    duplicate_rows = manifest_df[manifest_df.duplicated(subset=["patient", "blood", "tumor", "tissue"], keep=False)]
+    for _, row in duplicate_rows.drop_duplicates(subset=["patient", "blood", "tumor", "tissue"]).iterrows():
+        warnings.append({
+            "warning_type": "duplicate_manifest_row",
+            "scope": "manifest",
+            "patient_id": row["patient"],
+            "sample_id": "",
+            "tissue_sample_id": row["tissue"],
+            "details": f"Duplicate manifest row for patient `{row['patient']}`, blood `{row['blood']}`, tumor `{row['tumor']}`, tissue `{row['tissue']}`.",
+        })
+
+    duplicate_tissues = manifest_df[manifest_df.duplicated(subset=["patient", "tissue"], keep=False)]
+    for _, row in duplicate_tissues.drop_duplicates(subset=["patient", "tissue"]).iterrows():
+        warnings.append({
+            "warning_type": "duplicate_patient_tissue",
+            "scope": "manifest",
+            "patient_id": row["patient"],
+            "sample_id": "",
+            "tissue_sample_id": row["tissue"],
+            "details": f"Manifest contains multiple rows for patient `{row['patient']}` and tissue `{row['tissue']}`.",
+        })
+
+    sample_lookup = sample_df.set_index("sample_id")[["patient_id", "sample_group"]].to_dict("index")
+    analysis_keys = {
+        (str(row["patient_id"]), str(row["blood_sample_id"]), str(row["tumor_sample_id"]), str(row["tissue_sample_id"]))
+        for _, row in analysis_df.iterrows()
+    }
+
+    for _, row in manifest_df.iterrows():
+        patient_id = row["patient"]
+        tissue_id = row["tissue"]
+        for role, expected_group in [("blood", "blood"), ("tumor", "tumor"), ("tissue", "tissue")]:
+            sample_id = row[role]
+            sample_info = sample_lookup.get(sample_id)
+            if sample_info is None:
+                warnings.append({
+                    "warning_type": "manifest_missing_sample",
+                    "scope": "manifest",
+                    "patient_id": patient_id,
+                    "sample_id": sample_id,
+                    "tissue_sample_id": tissue_id,
+                    "details": f"Manifest references missing {role} sample `{sample_id}` for patient `{patient_id}`.",
+                })
+                continue
+
+            if str(sample_info["patient_id"]) != patient_id:
+                warnings.append({
+                    "warning_type": "manifest_patient_mismatch",
+                    "scope": "manifest",
+                    "patient_id": patient_id,
+                    "sample_id": sample_id,
+                    "tissue_sample_id": tissue_id,
+                    "details": f"Manifest patient `{patient_id}` does not match the patient parsed from sample `{sample_id}`.",
+                })
+
+            if str(sample_info["sample_group"]) != expected_group:
+                warnings.append({
+                    "warning_type": "manifest_sample_type_mismatch",
+                    "scope": "manifest",
+                    "patient_id": patient_id,
+                    "sample_id": sample_id,
+                    "tissue_sample_id": tissue_id,
+                    "details": f"Sample `{sample_id}` is not recognized as a {expected_group} sample.",
+                })
+
+        analysis_key = (patient_id, row["blood"], row["tumor"], row["tissue"])
+        if analysis_key not in analysis_keys:
+            warnings.append({
+                "warning_type": "missing_analysis_output",
+                "scope": "analysis",
+                "patient_id": patient_id,
+                "sample_id": "",
+                "tissue_sample_id": tissue_id,
+                "details": f"No patient analysis directory or expected outputs were found for patient `{patient_id}` tissue `{tissue_id}`.",
+            })
+
+    return warnings
+
+
 def build_recovered_variant_records(analysis_df: pd.DataFrame) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
 
@@ -645,6 +835,56 @@ def build_tumor_pass_variant_records(analysis_df: pd.DataFrame) -> list[dict[str
     return records
 
 
+def build_tissue_variant_records(analysis_df: pd.DataFrame) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+
+    for analysis in analysis_df.to_dict(orient="records"):
+        tissue_df = read_annovar_csv(analysis["tissue_pass_annotation_csv"])
+        if tissue_df.empty:
+            continue
+
+        tumor_df = read_annovar_csv(analysis["tumor_annotation_csv"])
+        tissue_cols = resolve_annovar_columns(tissue_df)
+        tumor_cols = resolve_annovar_columns(tumor_df) if not tumor_df.empty else {}
+        tumor_rows = {row["variant_key"]: row for _, row in tumor_df.iterrows()} if not tumor_df.empty else {}
+
+        for _, tissue_row in tissue_df.iterrows():
+            tumor_row = tumor_rows.get(tissue_row["variant_key"])
+            matched = tumor_row is not None
+            records.append({
+                "patient_id": analysis["patient_id"],
+                "blood_sample_id": analysis["blood_sample_id"],
+                "tumor_sample_id": analysis["tumor_sample_id"],
+                "tissue_sample_id": analysis["tissue_sample_id"],
+                "analysis_dir": analysis["analysis_dir"],
+                "variant_key": tissue_row["variant_key"],
+                "chrom": str(tissue_row["Chr"]),
+                "pos": int(float(tissue_row["Start"])),
+                "end": int(float(tissue_row["End"])),
+                "ref": str(tissue_row["Ref"]),
+                "alt": str(tissue_row["Alt"]),
+                "gene": first_value(tissue_row, [tissue_cols["gene"]]),
+                "hgvs": first_value(tissue_row, [tissue_cols["hgvs"]]),
+                "clinvar": first_value(tissue_row, [tissue_cols["clinvar"]]),
+                "dbsnp": first_value(tissue_row, [tissue_cols["dbsnp"]]),
+                "cosmic": first_value(tissue_row, [tissue_cols["cosmic"]]),
+                "intervar": first_value(tissue_row, [tissue_cols["intervar"]]),
+                "tissue_af": numeric_value(tissue_row, [tissue_cols["af"]]),
+                "tissue_dp": numeric_value(tissue_row, [tissue_cols["dp"]]),
+                "matched_in_tumor": matched,
+                "tumor_af": numeric_value(tumor_row, [tumor_cols.get("af")]) if matched else None,
+                "tumor_dp": numeric_value(tumor_row, [tumor_cols.get("dp")]) if matched else None,
+                "tumor_gene": first_value(tumor_row, [tumor_cols.get("gene")]) if matched else "",
+                "tumor_hgvs": first_value(tumor_row, [tumor_cols.get("hgvs")]) if matched else "",
+                "tissue_filter": "PASS",
+                "tumor_filter": "PASS" if matched else "",
+                "tissue_row_json": json.dumps(tissue_row.to_dict(), ensure_ascii=True),
+                "tumor_row_json": json.dumps(tumor_row.to_dict(), ensure_ascii=True) if matched else "",
+            })
+
+    return records
+
+
 def dataframe_from_records(records: list[dict[str, Any]], columns: list[str]) -> pd.DataFrame:
     if not records:
         return pd.DataFrame(columns=columns)
@@ -667,21 +907,31 @@ def main() -> None:
     analysis_records = build_analysis_records(results_root, sample_df)
     analysis_df = dataframe_from_records(analysis_records, ANALYSIS_COLUMNS)
 
+    warning_records = validate_results(results_root, sample_df, analysis_df)
+    warning_df = dataframe_from_records(warning_records, WARNING_COLUMNS)
+
     recovered_records = build_recovered_variant_records(analysis_df)
     recovered_df = dataframe_from_records(recovered_records, RECOVERED_COLUMNS)
 
     tumor_pass_records = build_tumor_pass_variant_records(analysis_df)
     tumor_pass_df = dataframe_from_records(tumor_pass_records, TUMOR_PASS_COLUMNS)
 
+    tissue_variant_records = build_tissue_variant_records(analysis_df)
+    tissue_variant_df = dataframe_from_records(tissue_variant_records, TISSUE_VARIANT_COLUMNS)
+
     con = duckdb.connect(str(db_path))
     con.register("sample_df", sample_df)
     con.execute("create or replace table sample_metrics as select * from sample_df")
     con.register("analysis_df", analysis_df)
     con.execute("create or replace table analysis_runs as select * from analysis_df")
+    con.register("warning_df", warning_df)
+    con.execute("create or replace table refresh_warnings as select * from warning_df")
     con.register("recovered_df", recovered_df)
     con.execute("create or replace table recovered_variants as select * from recovered_df")
     con.register("tumor_pass_df", tumor_pass_df)
     con.execute("create or replace table tumor_pass_variants as select * from tumor_pass_df")
+    con.register("tissue_variant_df", tissue_variant_df)
+    con.execute("create or replace table tissue_variants as select * from tissue_variant_df")
     con.execute(
         "create or replace table dashboard_metadata as select current_timestamp as refreshed_at, ? as results_root",
         [str(results_root)],
@@ -691,8 +941,10 @@ def main() -> None:
     print(f"Refreshed dashboard database: {db_path}")
     print(f"Samples loaded: {len(sample_df)}")
     print(f"Analyses loaded: {len(analysis_df)}")
+    print(f"Warnings loaded: {len(warning_df)}")
     print(f"Recovered variants loaded: {len(recovered_df)}")
     print(f"Tumor PASS variants loaded: {len(tumor_pass_df)}")
+    print(f"Tissue PASS variants loaded: {len(tissue_variant_df)}")
 
 
 if __name__ == "__main__":

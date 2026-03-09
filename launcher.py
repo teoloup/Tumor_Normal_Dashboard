@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -19,6 +20,9 @@ DATA_SERVER_SCRIPT = BASE_DIR / "data_server.py"
 DATA_SERVER_HOST = "127.0.0.1"
 DATA_SERVER_PORT = 8765
 DATA_BASE_URL = f"http://{DATA_SERVER_HOST}:{DATA_SERVER_PORT}"
+DOCKER_IMAGE = "tumor-normal-variant-dashboard:latest"
+DOCKER_CONTAINER = "tumor_normal_variant_dashboard"
+DEFAULT_LAUNCH_MODE = os.environ.get("TNVD_LAUNCH_MODE", "native")
 
 
 class DashboardLauncher:
@@ -32,6 +36,7 @@ class DashboardLauncher:
         LOCAL_DIR.mkdir(parents=True, exist_ok=True)
         config = self.load_config()
 
+        self.launch_mode_var = tk.StringVar(value=config.get("launch_mode", DEFAULT_LAUNCH_MODE))
         self.results_root_var = tk.StringVar(value=config.get("results_root", ""))
         self.db_path_var = tk.StringVar(value=config.get("db_path", str(DEFAULT_DB_PATH)))
         self.igv_js_path_var = tk.StringVar(value=config.get("igv_js_path", str(DEFAULT_IGV_JS_PATH)))
@@ -54,6 +59,7 @@ class DashboardLauncher:
 
     def save_config(self) -> None:
         payload = {
+            "launch_mode": self.launch_mode_var.get().strip(),
             "results_root": self.results_root_var.get().strip(),
             "db_path": self.db_path_var.get().strip(),
             "igv_js_path": self.igv_js_path_var.get().strip(),
@@ -74,23 +80,35 @@ class DashboardLauncher:
         )
         subtitle.grid(row=1, column=0, columnspan=3, sticky="w", pady=(4, 16))
 
-        ttk.Label(frame, text="Synced results root").grid(row=2, column=0, sticky="w", pady=(0, 8))
-        ttk.Entry(frame, textvariable=self.results_root_var).grid(row=2, column=1, sticky="ew", padx=(8, 8), pady=(0, 8))
-        ttk.Button(frame, text="Browse...", command=self.pick_results_root).grid(row=2, column=2, sticky="ew", pady=(0, 8))
+        ttk.Label(frame, text="Run mode").grid(row=2, column=0, sticky="w", pady=(0, 8))
+        self.mode_combo = ttk.Combobox(
+            frame,
+            textvariable=self.launch_mode_var,
+            values=["native", "docker"],
+            state="readonly",
+        )
+        self.mode_combo.grid(row=2, column=1, sticky="w", padx=(8, 8), pady=(0, 8))
+        self.mode_combo.bind("<<ComboboxSelected>>", lambda _event: self.on_mode_change())
 
-        ttk.Label(frame, text="DuckDB file").grid(row=3, column=0, sticky="w", pady=(0, 8))
-        ttk.Entry(frame, textvariable=self.db_path_var).grid(row=3, column=1, sticky="ew", padx=(8, 8), pady=(0, 8))
-        ttk.Button(frame, text="Browse...", command=self.pick_db_path).grid(row=3, column=2, sticky="ew", pady=(0, 8))
+        ttk.Label(frame, text="Synced results root").grid(row=3, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(frame, textvariable=self.results_root_var).grid(row=3, column=1, sticky="ew", padx=(8, 8), pady=(0, 8))
+        ttk.Button(frame, text="Browse...", command=self.pick_results_root).grid(row=3, column=2, sticky="ew", pady=(0, 8))
 
-        ttk.Label(frame, text="Local IGV.js file").grid(row=4, column=0, sticky="w", pady=(0, 8))
-        ttk.Entry(frame, textvariable=self.igv_js_path_var).grid(row=4, column=1, sticky="ew", padx=(8, 8), pady=(0, 8))
-        ttk.Button(frame, text="Browse...", command=self.pick_igv_js_path).grid(row=4, column=2, sticky="ew", pady=(0, 8))
+        ttk.Label(frame, text="DuckDB file").grid(row=4, column=0, sticky="w", pady=(0, 8))
+        ttk.Entry(frame, textvariable=self.db_path_var).grid(row=4, column=1, sticky="ew", padx=(8, 8), pady=(0, 8))
+        ttk.Button(frame, text="Browse...", command=self.pick_db_path).grid(row=4, column=2, sticky="ew", pady=(0, 8))
+
+        ttk.Label(frame, text="Local IGV.js file").grid(row=5, column=0, sticky="w", pady=(0, 8))
+        self.igv_entry = ttk.Entry(frame, textvariable=self.igv_js_path_var)
+        self.igv_entry.grid(row=5, column=1, sticky="ew", padx=(8, 8), pady=(0, 8))
+        self.igv_browse_button = ttk.Button(frame, text="Browse...", command=self.pick_igv_js_path)
+        self.igv_browse_button.grid(row=5, column=2, sticky="ew", pady=(0, 8))
 
         info = ttk.Label(frame, text=f"Local BAM server URL: {DATA_BASE_URL}")
-        info.grid(row=5, column=0, columnspan=3, sticky="w", pady=(0, 8))
+        info.grid(row=6, column=0, columnspan=3, sticky="w", pady=(0, 8))
 
         button_row = ttk.Frame(frame)
-        button_row.grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 12))
+        button_row.grid(row=7, column=0, columnspan=3, sticky="w", pady=(8, 12))
 
         self.save_button = ttk.Button(button_row, text="Save Paths", command=self.on_save)
         self.save_button.pack(side="left", padx=(0, 8))
@@ -108,34 +126,58 @@ class DashboardLauncher:
         self.folder_button.pack(side="left")
 
         status_label = ttk.Label(frame, textvariable=self.status_var, foreground="#1f4d7a")
-        status_label.grid(row=7, column=0, columnspan=3, sticky="w")
+        status_label.grid(row=8, column=0, columnspan=3, sticky="w")
 
-        ttk.Label(frame, text="Log").grid(row=8, column=0, sticky="w", pady=(12, 4))
+        ttk.Label(frame, text="Log").grid(row=9, column=0, sticky="w", pady=(12, 4))
         self.log_box = tk.Text(frame, height=14, wrap="word")
-        self.log_box.grid(row=9, column=0, columnspan=3, sticky="nsew")
-        frame.rowconfigure(9, weight=1)
+        self.log_box.grid(row=10, column=0, columnspan=3, sticky="nsew")
+        frame.rowconfigure(10, weight=1)
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.log_box.yview)
-        scrollbar.grid(row=9, column=3, sticky="ns")
+        scrollbar.grid(row=10, column=3, sticky="ns")
         self.log_box.configure(yscrollcommand=scrollbar.set)
 
         self.log("Launcher ready.")
+        self.on_mode_change()
 
-    def is_dashboard_running(self) -> bool:
+    def is_native_dashboard_running(self) -> bool:
         return self.streamlit_process is not None and self.streamlit_process.poll() is None
+
+    def is_docker_dashboard_running(self) -> bool:
+        result = subprocess.run(
+            ["docker", "ps", "-q", "-f", f"name=^{DOCKER_CONTAINER}$"],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0 and bool(result.stdout.strip())
 
     def is_data_server_running(self) -> bool:
         return self.data_server_process is not None and self.data_server_process.poll() is None
 
+    def launch_mode(self) -> str:
+        return self.launch_mode_var.get().strip().lower() or "native"
+
     def update_button_state(self) -> None:
-        dashboard_running = self.is_dashboard_running()
+        dashboard_running = self.is_native_dashboard_running() if self.launch_mode() == "native" else self.is_docker_dashboard_running()
         self.open_button.config(state="disabled" if dashboard_running else "normal")
-        self.stop_button.config(state="normal" if dashboard_running or self.is_data_server_running() else "disabled")
+        stop_enabled = dashboard_running or (self.launch_mode() == "native" and self.is_data_server_running())
+        self.stop_button.config(state="normal" if stop_enabled else "disabled")
         self.refresh_button.config(state="disabled" if self.refresh_in_progress else "normal")
 
     def log(self, message: str) -> None:
         self.log_box.insert("end", message + "\n")
         self.log_box.see("end")
+
+    def on_mode_change(self) -> None:
+        docker_mode = self.launch_mode() == "docker"
+        igv_state = "disabled" if docker_mode else "normal"
+        self.igv_entry.config(state=igv_state)
+        self.igv_browse_button.config(state=igv_state)
+        if docker_mode:
+            self.status_var.set("Docker mode selected")
+        else:
+            self.status_var.set("Native mode selected")
+        self.update_button_state()
 
     def pick_results_root(self) -> None:
         selected = filedialog.askdirectory(title="Select synced HPC results root")
@@ -175,7 +217,9 @@ class DashboardLauncher:
             messagebox.showerror("Missing database path", "Select a valid DuckDB database path.")
             return None
 
-        if not self.igv_js_path_var.get().strip() or not igv_js_path.exists() or not igv_js_path.is_file():
+        if self.launch_mode() == "native" and (
+            not self.igv_js_path_var.get().strip() or not igv_js_path.exists() or not igv_js_path.is_file()
+        ):
             messagebox.showerror("Missing IGV.js file", "Select a valid local igv.min.js file for the alignment viewer.")
             return None
 
@@ -233,7 +277,7 @@ class DashboardLauncher:
         self.log("Local BAM server stopped.")
 
     def stop_dashboard_process(self) -> None:
-        if not self.is_dashboard_running():
+        if not self.is_native_dashboard_running():
             self.streamlit_process = None
             return
 
@@ -255,6 +299,86 @@ class DashboardLauncher:
         self.stop_data_server()
         self.update_button_state()
 
+    def ensure_docker_available(self) -> bool:
+        result = subprocess.run(["docker", "--version"], capture_output=True, text=True)
+        if result.returncode != 0:
+            messagebox.showerror("Docker not available", "Docker Desktop was not found or is not available in PATH.")
+            self.status_var.set("Docker unavailable")
+            return False
+        return True
+
+    def refresh_docker_database(self, results_root: Path, db_path: Path) -> int:
+        command = [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{results_root.resolve()}:/data",
+            "-v",
+            f"{db_path.parent.resolve()}:/state",
+            "-e",
+            f"TNVD_DB_PATH=/state/{db_path.name}",
+            DOCKER_IMAGE,
+            "python",
+            "/app/dashboard/refresh_dashboard_data.py",
+            "--results-root",
+            "/data",
+            "--db-path",
+            f"/state/{db_path.name}",
+        ]
+        self.log("Running: " + " ".join(command))
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.stdout:
+            self.log(completed.stdout.strip())
+        if completed.stderr:
+            self.log(completed.stderr.strip())
+        return completed.returncode
+
+    def launch_docker_dashboard(self, results_root: Path, db_path: Path) -> bool:
+        if not self.ensure_docker_available():
+            return False
+
+        subprocess.run(["docker", "rm", "-f", DOCKER_CONTAINER], capture_output=True, text=True)
+        command = [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            DOCKER_CONTAINER,
+            "-p",
+            "8501:8501",
+            "-p",
+            "8765:8765",
+            "-v",
+            f"{results_root.resolve()}:/data",
+            "-v",
+            f"{db_path.parent.resolve()}:/state",
+            "-e",
+            f"TNVD_DB_PATH=/state/{db_path.name}",
+            "-e",
+            "TNVD_CONTAINER_MODE=1",
+            DOCKER_IMAGE,
+        ]
+        self.log("Launching Docker dashboard: " + " ".join(command))
+        completed = subprocess.run(command, capture_output=True, text=True)
+        if completed.stdout:
+            self.log(completed.stdout.strip())
+        if completed.stderr:
+            self.log(completed.stderr.strip())
+        if completed.returncode != 0:
+            messagebox.showerror("Docker launch failed", "Could not start the Docker dashboard container.")
+            self.status_var.set("Docker launch failed")
+            return False
+
+        subprocess.Popen(["cmd", "/c", "start", "", "http://127.0.0.1:8501"])
+        self.status_var.set("Docker dashboard launched")
+        return True
+
+    def stop_docker_dashboard(self) -> None:
+        self.log("Stopping Docker dashboard container...")
+        subprocess.run(["docker", "rm", "-f", DOCKER_CONTAINER], capture_output=True, text=True)
+        self.log("Docker dashboard container stopped.")
+
     def on_save(self) -> None:
         validated = self.validate_inputs()
         if not validated:
@@ -271,43 +395,60 @@ class DashboardLauncher:
         results_root, db_path, igv_js_path = validated
         self.save_config()
 
-        if self.is_dashboard_running():
-            should_stop = messagebox.askyesno(
-                "Stop dashboard",
-                "The dashboard is running and keeps the database open. Stop the dashboard and local BAM server before refreshing?",
-            )
-            if not should_stop:
-                self.log("Refresh cancelled because the dashboard is still running.")
+        if self.launch_mode() == "native":
+            if self.is_native_dashboard_running():
+                should_stop = messagebox.askyesno(
+                    "Stop dashboard",
+                    "The dashboard is running and keeps the database open. Stop the dashboard and local BAM server before refreshing?",
+                )
+                if not should_stop:
+                    self.log("Refresh cancelled because the dashboard is still running.")
+                    return
+                self.stop_services()
+        else:
+            if not self.ensure_docker_available():
                 return
-            self.stop_services()
+            if self.is_docker_dashboard_running():
+                should_stop = messagebox.askyesno(
+                    "Stop Docker dashboard",
+                    "The Docker dashboard is running. Stop the Docker container before refreshing the database?",
+                )
+                if not should_stop:
+                    self.log("Refresh cancelled because the Docker dashboard is still running.")
+                    return
+                self.stop_docker_dashboard()
 
         self.status_var.set("Refreshing database...")
         self.refresh_in_progress = True
         self.update_button_state()
 
         def worker() -> None:
-            command = [
-                sys.executable,
-                str(REFRESH_SCRIPT),
-                "--results-root",
-                str(results_root),
-                "--db-path",
-                str(db_path),
-            ]
-            self.log("Running: " + " ".join(command))
-            completed = subprocess.run(command, capture_output=True, text=True)
-            if completed.stdout:
-                self.log(completed.stdout.strip())
-            if completed.stderr:
-                self.log(completed.stderr.strip())
+            if self.launch_mode() == "native":
+                command = [
+                    sys.executable,
+                    str(REFRESH_SCRIPT),
+                    "--results-root",
+                    str(results_root),
+                    "--db-path",
+                    str(db_path),
+                ]
+                self.log("Running: " + " ".join(command))
+                completed = subprocess.run(command, capture_output=True, text=True)
+                if completed.stdout:
+                    self.log(completed.stdout.strip())
+                if completed.stderr:
+                    self.log(completed.stderr.strip())
+                returncode = completed.returncode
+            else:
+                returncode = self.refresh_docker_database(results_root, db_path)
 
             self.refresh_in_progress = False
-            if completed.returncode == 0:
+            if returncode == 0:
                 self.status_var.set("Database refresh completed")
                 self.log("Database refresh completed successfully.")
             else:
                 self.status_var.set("Database refresh failed")
-                self.log(f"Database refresh failed with exit code {completed.returncode}.")
+                self.log(f"Database refresh failed with exit code {returncode}.")
             self.root.after(0, self.update_button_state)
 
         threading.Thread(target=worker, daemon=True).start()
@@ -320,7 +461,18 @@ class DashboardLauncher:
         results_root, db_path, igv_js_path = validated
         self.save_config()
 
-        if self.is_dashboard_running():
+        if self.launch_mode() == "docker":
+            if self.is_docker_dashboard_running():
+                self.status_var.set("Docker dashboard already running")
+                self.log("Docker dashboard is already running.")
+                self.update_button_state()
+                return
+            if self.launch_docker_dashboard(results_root, db_path):
+                self.log("Docker dashboard started.")
+            self.update_button_state()
+            return
+
+        if self.is_native_dashboard_running():
             self.status_var.set("Dashboard already running")
             self.log("Dashboard is already running.")
             self.update_button_state()
@@ -359,7 +511,18 @@ class DashboardLauncher:
         self.update_button_state()
 
     def on_stop_dashboard(self) -> None:
-        if not self.is_dashboard_running() and not self.is_data_server_running():
+        if self.launch_mode() == "docker":
+            if not self.is_docker_dashboard_running():
+                self.status_var.set("Docker dashboard is not running")
+                self.log("No running Docker dashboard container was found.")
+                self.update_button_state()
+                return
+            self.stop_docker_dashboard()
+            self.status_var.set("Docker dashboard stopped")
+            self.update_button_state()
+            return
+
+        if not self.is_native_dashboard_running() and not self.is_data_server_running():
             self.status_var.set("Dashboard is not running")
             self.log("No running dashboard or local BAM server process was found.")
             self.update_button_state()
@@ -372,7 +535,15 @@ class DashboardLauncher:
         subprocess.Popen(["explorer", str(BASE_DIR)])
 
     def on_close(self) -> None:
-        if self.is_dashboard_running() or self.is_data_server_running():
+        if self.launch_mode() == "docker":
+            if self.is_docker_dashboard_running():
+                should_stop = messagebox.askyesno(
+                    "Stop Docker dashboard",
+                    "The Docker dashboard is still running. Stop the container before closing the launcher?",
+                )
+                if should_stop:
+                    self.stop_docker_dashboard()
+        elif self.is_native_dashboard_running() or self.is_data_server_running():
             should_stop = messagebox.askyesno(
                 "Stop dashboard",
                 "The dashboard or local BAM server is still running. Stop them before closing the launcher?",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+import os
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
@@ -16,6 +17,8 @@ import streamlit.components.v1 as components
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "local" / "tumor_normal_variant_dashboard.duckdb"
 DEFAULT_DATA_BASE_URL = "http://127.0.0.1:8765"
 DEFAULT_IGV_JS_PATH = Path(__file__).resolve().parent / "local" / "igv.min.js"
+LOW_COVERAGE_THRESHOLD = 30
+RUNNING_IN_DOCKER = os.environ.get("TNVD_CONTAINER_MODE") == "1"
 
 
 @st.cache_resource
@@ -208,6 +211,21 @@ def main() -> None:
 
     st.title("Tumor Normal Variant Dashboard")
     st.caption("Local dashboard for reviewing patient-level results after syncing pipeline outputs from the HPC cluster.")
+    if RUNNING_IN_DOCKER:
+        st.warning("Docker mode: closing the browser does not stop the container. Use the launcher Stop Dashboard button or run stop_dashboard_docker.cmd.")
+        if st.button("Stop Docker Dashboard", key="stop_docker_dashboard"):
+            os._exit(0)
+        components.html(
+            """
+            <script>
+            window.addEventListener("beforeunload", function (event) {
+              event.preventDefault();
+              event.returnValue = "";
+            });
+            </script>
+            """,
+            height=0,
+        )
 
     db_path = st.sidebar.text_input("DuckDB path", value=args.db_path)
     data_base_url = st.sidebar.text_input("Local data server", value=args.data_base_url)
@@ -222,8 +240,10 @@ def main() -> None:
     metadata = run_query(con, "select * from dashboard_metadata") if table_exists(con, "dashboard_metadata") else pd.DataFrame()
     samples = run_query(con, "select * from sample_metrics") if table_exists(con, "sample_metrics") else pd.DataFrame()
     analyses = run_query(con, "select * from analysis_runs order by patient_id, tissue_sample_id") if table_exists(con, "analysis_runs") else pd.DataFrame()
+    warnings_df = run_query(con, "select * from refresh_warnings order by warning_type, patient_id, tissue_sample_id") if table_exists(con, "refresh_warnings") else pd.DataFrame()
     recovered = run_query(con, "select * from recovered_variants order by patient_id, tissue_sample_id, chrom, pos") if table_exists(con, "recovered_variants") else pd.DataFrame()
     tumor_pass = run_query(con, "select * from tumor_pass_variants order by patient_id, tissue_sample_id, chrom, pos") if table_exists(con, "tumor_pass_variants") else pd.DataFrame()
+    tissue_variants = run_query(con, "select * from tissue_variants order by patient_id, tissue_sample_id, chrom, pos") if table_exists(con, "tissue_variants") else pd.DataFrame()
 
     samples = ensure_columns(samples, [
         "sample_id",
@@ -235,9 +255,18 @@ def main() -> None:
         "flagstat_mapped_pct",
         "mean_coverage_before_gencore",
         "mean_coverage_after_gencore",
-        "per_base_bed_gz",
+        "before_per_base_bed_gz",
+        "after_per_base_bed_gz",
         "bam_relpath",
         "bai_relpath",
+    ])
+    warnings_df = ensure_columns(warnings_df, [
+        "warning_type",
+        "scope",
+        "patient_id",
+        "sample_id",
+        "tissue_sample_id",
+        "details",
     ])
     recovered = ensure_columns(recovered, [
         "patient_id",
@@ -259,6 +288,28 @@ def main() -> None:
         "alt",
         "tumor_row_json",
         "tissue_row_json",
+    ])
+    tissue_variants = ensure_columns(tissue_variants, [
+        "patient_id",
+        "tissue_sample_id",
+        "variant_key",
+        "gene",
+        "hgvs",
+        "clinvar",
+        "tissue_af",
+        "tissue_dp",
+        "matched_in_tumor",
+        "tumor_af",
+        "tumor_dp",
+        "dbsnp",
+        "cosmic",
+        "intervar",
+        "chrom",
+        "pos",
+        "ref",
+        "alt",
+        "tissue_row_json",
+        "tumor_row_json",
     ])
     tumor_pass = ensure_columns(tumor_pass, [
         "patient_id",
@@ -315,6 +366,11 @@ def main() -> None:
         metric_b.metric("Sample Runs", len(samples))
         metric_c.metric("Triplet Analyses", len(analyses))
         metric_d.metric("Recovered Variants", len(recovered))
+
+        if not warnings_df.empty:
+            st.subheader("Refresh Warnings")
+            st.warning(f"{len(warnings_df)} warning(s) were detected while comparing patient_triplets.tsv against the synced results tree.")
+            st.dataframe(warnings_df, width="stretch", hide_index=True)
 
         if not analyses.empty:
             summary = analyses[[
@@ -380,20 +436,23 @@ def main() -> None:
             ]].copy()
             st.dataframe(sample_table, width="stretch", hide_index=True)
 
+            show_all_tissue = st.checkbox("Show all tissue variants", value=False, key="patient_show_all_tissue")
             patient_recovered = recovered[
                 (recovered["patient_id"] == selected_patient)
                 & (recovered["tissue_sample_id"] == analysis_row["tissue_sample_id"])
             ].copy()
+            patient_tissue_variants = tissue_variants[
+                (tissue_variants["patient_id"] == selected_patient)
+                & (tissue_variants["tissue_sample_id"] == analysis_row["tissue_sample_id"])
+            ].copy()
 
-            threshold = st.slider("Warning threshold for tissue AF", min_value=0.0, max_value=0.25, value=0.02, step=0.005)
-
-            st.subheader("Recovered Variants")
-            if patient_recovered.empty:
-                st.info("No recovered variants were found for this patient analysis.")
+            variant_table_label = "All Tissue PASS Variants" if show_all_tissue else "Recovered Variants"
+            st.subheader(variant_table_label)
+            current_variant_df = patient_tissue_variants if show_all_tissue else patient_recovered
+            if current_variant_df.empty:
+                st.info(f"No variants were found for this patient analysis in `{variant_table_label}`.")
             else:
-                patient_recovered["warning_flag"] = patient_recovered["tissue_af"].fillna(0) >= threshold
                 display_columns = [
-                    "warning_flag",
                     "variant_key",
                     "gene",
                     "hgvs",
@@ -406,15 +465,21 @@ def main() -> None:
                     "cosmic",
                     "intervar",
                 ]
-                st.dataframe(patient_recovered[display_columns], width="stretch", hide_index=True)
+                if show_all_tissue:
+                    display_columns.insert(4, "matched_in_tumor")
 
-                option_labels = patient_recovered.apply(
-                    lambda row: f"{row['variant_key']} | {row['gene']} | tumor AF={format_metric(row['tumor_af'])} | tissue AF={format_metric(row['tissue_af'])}",
+                st.dataframe(current_variant_df[display_columns], width="stretch", hide_index=True)
+
+                option_labels = current_variant_df.apply(
+                    lambda row: (
+                        f"{row['variant_key']} | {row['gene']} | "
+                        f"tumor AF={format_metric(row['tumor_af'])} | tissue AF={format_metric(row['tissue_af'])}"
+                    ),
                     axis=1,
                 ).tolist()
                 selected_variant_label = st.selectbox("Variant details", option_labels)
                 variant_idx = option_labels.index(selected_variant_label)
-                variant_row = patient_recovered.iloc[variant_idx]
+                variant_row = current_variant_df.iloc[variant_idx]
 
                 if st.button("View in BAM", key="view_in_bam"):
                     st.session_state.alignment_variant = {
@@ -449,29 +514,60 @@ def main() -> None:
                 af_fig.update_traces(texttemplate="%{text}", textposition="outside")
                 st.plotly_chart(af_fig, width="stretch")
 
-                st.subheader("Coverage Across Blood / Tumor / Tissue")
+                st.subheader("Per-Base Coverage Across Blood / Tumor / Tissue")
                 coverage_records = []
                 for sample_id in sample_ids:
                     sample_row = samples[samples["sample_id"] == sample_id].iloc[0]
-                    depth = lookup_per_base_depth(sample_row["per_base_bed_gz"], variant_row["chrom"], int(variant_row["pos"]))
+                    before_depth = lookup_per_base_depth(sample_row["before_per_base_bed_gz"], variant_row["chrom"], int(variant_row["pos"]))
+                    after_depth = lookup_per_base_depth(sample_row["after_per_base_bed_gz"], variant_row["chrom"], int(variant_row["pos"]))
                     coverage_records.append({
                         "sample_id": sample_id,
                         "sample_group": sample_row["sample_group"],
                         "chrom": variant_row["chrom"],
                         "pos": int(variant_row["pos"]),
-                        "depth": depth,
+                        "before_gencore_depth": before_depth,
+                        "after_gencore_depth": after_depth,
                     })
 
                 coverage_df = pd.DataFrame(coverage_records)
+                coverage_plot_df = coverage_df.melt(
+                    id_vars=["sample_id", "sample_group", "chrom", "pos"],
+                    value_vars=["before_gencore_depth", "after_gencore_depth"],
+                    var_name="stage",
+                    value_name="depth",
+                )
+                coverage_plot_df["stage"] = coverage_plot_df["stage"].map({
+                    "before_gencore_depth": "before_gencore",
+                    "after_gencore_depth": "after_gencore",
+                })
                 coverage_fig = px.bar(
-                    coverage_df,
+                    coverage_plot_df,
                     x="sample_id",
                     y="depth",
-                    color="sample_group",
-                    labels={"depth": "Per-base depth", "sample_id": "Sample"},
+                    color="stage",
+                    barmode="group",
+                    labels={"depth": "Per-base depth", "sample_id": "Sample", "stage": "Stage"},
                 )
                 st.plotly_chart(coverage_fig, width="stretch")
                 st.dataframe(coverage_df, width="stretch", hide_index=True)
+
+                if pd.notna(variant_row["tumor_af"]):
+                    low_coverage_samples = coverage_df[
+                        coverage_df["sample_group"].isin(["blood", "tissue"])
+                        & (
+                            coverage_df["after_gencore_depth"].isna()
+                            | (coverage_df["after_gencore_depth"] < LOW_COVERAGE_THRESHOLD)
+                        )
+                    ]
+                    if not low_coverage_samples.empty:
+                        sample_text = ", ".join(
+                            f"{row['sample_id']} ({format_metric(row['after_gencore_depth'])})"
+                            for _, row in low_coverage_samples.iterrows()
+                        )
+                        st.warning(
+                            f"Tumor variant coverage warning: one or more non-tumor samples are not adequately covered after gencore "
+                            f"(< {LOW_COVERAGE_THRESHOLD}x or missing). Samples: {sample_text}"
+                        )
 
                 left, right = st.columns(2)
                 with left:
@@ -485,12 +581,15 @@ def main() -> None:
         if analyses.empty or analysis_row is None or selected_patient is None:
             st.info("No analyses were found in the dashboard database yet.")
         else:
-            st.subheader("Export Tumor PASS Variants")
-            if tumor_pass.empty:
-                st.info("Tumor PASS export table is not available yet. Refresh the dashboard database with the latest refresh script.")
+            show_all_tissue_export = st.checkbox("Show all tissue variants", value=False, key="export_show_all_tissue")
+            export_source_df = tissue_variants.copy() if show_all_tissue_export else tumor_pass.copy()
+            export_title = "Export Tissue PASS Variants" if show_all_tissue_export else "Export Tumor PASS Variants"
+            st.subheader(export_title)
+            if export_source_df.empty:
+                st.info(f"{export_title} table is not available yet. Refresh the dashboard database with the latest refresh script.")
             else:
                 export_scope = st.selectbox("Export scope", ["Current analysis", "Current patient", "All analyses"])
-                export_df = tumor_pass.copy()
+                export_df = export_source_df
                 if export_scope == "Current analysis":
                     export_df = export_df[
                         (export_df["patient_id"] == selected_patient)
@@ -512,50 +611,93 @@ def main() -> None:
                 if gene_filter.strip():
                     export_df = export_df[export_df["gene"].fillna("").str.contains(gene_filter.strip(), case=False, na=False)]
 
-                only_matched = st.checkbox("Only variants matched in tissue", value=False)
-                if only_matched:
-                    export_df = export_df[export_df["matched_in_tissue"].fillna(False)]
-
-                available_export_columns = [
-                    "patient_id",
-                    "blood_sample_id",
-                    "tumor_sample_id",
-                    "tissue_sample_id",
-                    "variant_key",
-                    "chrom",
-                    "pos",
-                    "ref",
-                    "alt",
-                    "gene",
-                    "hgvs",
-                    "clinvar",
-                    "dbsnp",
-                    "cosmic",
-                    "intervar",
-                    "tumor_af",
-                    "tumor_dp",
-                    "matched_in_tissue",
-                    "tissue_af",
-                    "tissue_dp",
-                    "tissue_gene",
-                    "tissue_hgvs",
-                    "tumor_filter",
-                    "tissue_filter",
-                ]
-                default_export_columns = [
-                    "patient_id",
-                    "tumor_sample_id",
-                    "tissue_sample_id",
-                    "variant_key",
-                    "gene",
-                    "hgvs",
-                    "clinvar",
-                    "tumor_af",
-                    "tumor_dp",
-                    "matched_in_tissue",
-                    "tissue_af",
-                    "tissue_dp",
-                ]
+                if show_all_tissue_export:
+                    only_matched = st.checkbox("Only variants matched in tumor", value=False)
+                    if only_matched:
+                        export_df = export_df[export_df["matched_in_tumor"].fillna(False)]
+                    available_export_columns = [
+                        "patient_id",
+                        "blood_sample_id",
+                        "tumor_sample_id",
+                        "tissue_sample_id",
+                        "variant_key",
+                        "chrom",
+                        "pos",
+                        "ref",
+                        "alt",
+                        "gene",
+                        "hgvs",
+                        "clinvar",
+                        "dbsnp",
+                        "cosmic",
+                        "intervar",
+                        "tissue_af",
+                        "tissue_dp",
+                        "matched_in_tumor",
+                        "tumor_af",
+                        "tumor_dp",
+                        "tumor_gene",
+                        "tumor_hgvs",
+                        "tissue_filter",
+                        "tumor_filter",
+                    ]
+                    default_export_columns = [
+                        "patient_id",
+                        "tissue_sample_id",
+                        "variant_key",
+                        "gene",
+                        "hgvs",
+                        "clinvar",
+                        "tissue_af",
+                        "tissue_dp",
+                        "matched_in_tumor",
+                        "tumor_af",
+                        "tumor_dp",
+                    ]
+                else:
+                    only_matched = st.checkbox("Only variants matched in tissue", value=False)
+                    if only_matched:
+                        export_df = export_df[export_df["matched_in_tissue"].fillna(False)]
+                    available_export_columns = [
+                        "patient_id",
+                        "blood_sample_id",
+                        "tumor_sample_id",
+                        "tissue_sample_id",
+                        "variant_key",
+                        "chrom",
+                        "pos",
+                        "ref",
+                        "alt",
+                        "gene",
+                        "hgvs",
+                        "clinvar",
+                        "dbsnp",
+                        "cosmic",
+                        "intervar",
+                        "tumor_af",
+                        "tumor_dp",
+                        "matched_in_tissue",
+                        "tissue_af",
+                        "tissue_dp",
+                        "tissue_gene",
+                        "tissue_hgvs",
+                        "tumor_filter",
+                        "tissue_filter",
+                    ]
+                    default_export_columns = [
+                        "patient_id",
+                        "tumor_sample_id",
+                        "tissue_sample_id",
+                        "variant_key",
+                        "gene",
+                        "hgvs",
+                        "clinvar",
+                        "tumor_af",
+                        "tumor_dp",
+                        "matched_in_tissue",
+                        "tissue_af",
+                        "tissue_dp",
+                    ]
                 selected_columns = st.multiselect(
                     "Columns to export",
                     available_export_columns,
